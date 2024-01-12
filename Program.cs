@@ -1,44 +1,70 @@
+using Orleans.Runtime;
+
 var builder = WebApplication.CreateBuilder(args);
 
-// Add services to the container.
-// Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
-builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen();
-
-var app = builder.Build();
-
-// Configure the HTTP request pipeline.
-if (app.Environment.IsDevelopment())
+builder.Host.UseOrleans(static siloBuilder =>
 {
-    app.UseSwagger();
-    app.UseSwaggerUI();
-}
+    siloBuilder.UseLocalhostClustering();
+    siloBuilder.AddMemoryGrainStorage("urls");
+});
 
-app.UseHttpsRedirection();
+using var app = builder.Build();
 
-var summaries = new[]
-{
-    "Freezing", "Bracing", "Chilly", "Cool", "Mild", "Warm", "Balmy", "Hot", "Sweltering", "Scorching"
-};
+app.MapGet("/", static () => "Welcome to the URL shortener, powered by Orleans!");
 
-app.MapGet("/weatherforecast", () =>
-{
-    var forecast =  Enumerable.Range(1, 5).Select(index =>
-        new WeatherForecast
-        (
-            DateOnly.FromDateTime(DateTime.Now.AddDays(index)),
-            Random.Shared.Next(-20, 55),
-            summaries[Random.Shared.Next(summaries.Length)]
-        ))
-        .ToArray();
-    return forecast;
-})
-.WithName("GetWeatherForecast")
-.WithOpenApi();
+app.MapGet("/shorten",
+    static async (IGrainFactory grains, HttpRequest request, string url) =>
+    {
+        var host = $"{request.Scheme}://{request.Host.Value}";
+
+        // Validate the URL query string.
+        if (string.IsNullOrWhiteSpace(url) &&
+            Uri.IsWellFormedUriString(url, UriKind.Absolute) is false)
+        {
+            return Results.BadRequest($"""
+                The URL query string is required and needs to be well formed.
+                Consider, ${host}/shorten?url=https://www.microsoft.com.
+                """);
+        }
+
+        // Create a unique, short ID
+        var shortenedRouteSegment = Guid.NewGuid().GetHashCode().ToString("X");
+
+        // Create and persist a grain with the shortened ID and full URL
+        var shortenerGrain =
+            grains.GetGrain<IUrlShortenerGrain>(shortenedRouteSegment);
+
+        await shortenerGrain.SetUrl(url);
+
+        // Return the shortened URL for later use
+        var resultBuilder = new UriBuilder(host)
+        {
+            Path = $"/go/{shortenedRouteSegment}"
+        };
+
+        return Results.Ok(resultBuilder.Uri);
+    });
+
+app.MapGet("/go/{shortenedRouteSegment:required}",
+    static async (IGrainFactory grains, string shortenedRouteSegment) =>
+    {
+        // Retrieve the grain using the shortened ID and url to the original URL
+        var shortenerGrain =
+            grains.GetGrain<IUrlShortenerGrain>(shortenedRouteSegment);
+
+        var url = await shortenerGrain.GetUrl();
+
+        // Handles missing schemes, defaults to "http://".
+        var redirectBuilder = new UriBuilder(url);
+
+        return Results.Redirect(redirectBuilder.Uri.ToString());
+    });
 
 app.Run();
 
-record WeatherForecast(DateOnly Date, int TemperatureC, string? Summary)
+public interface IUrlShortenerGrain : IGrainWithStringKey
 {
-    public int TemperatureF => 32 + (int)(TemperatureC / 0.5556);
+    Task SetUrl(string fullUrl);
+
+    Task<string> GetUrl();
 }
